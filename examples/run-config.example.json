@@ -1,0 +1,14 @@
+{
+  "runs": [
+    {
+      "name": "extension-api-dev",
+      "collectionFile": "Extension API.postman_collection.json",
+      "environmentFile": "ext-api-dev.postman_environment.json"
+    }
+  ],
+  "paramValidation": {
+    "requestNames": ["Login"],
+    "runAllJsonBodyRequests": true
+  }
+}
+

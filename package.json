@@ -1,0 +1,22 @@
+{
+  "name": "postman-automation",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "automate": "node scripts/sanitize-and-run.js",
+    "automate:dev": "node scripts/sanitize-and-run.js dev",
+    "automate:prod": "node scripts/sanitize-and-run.js prod",
+    "validate:params": "node scripts/validate-required-params.js",
+    "validate:all": "node scripts/validate-required-params-all.js",
+    "build:simple:all": "node scripts/build-simple-required-report-all.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "fs-extra": "^11.3.4",
+    "newman": "^6.2.2"
+  }
+}
