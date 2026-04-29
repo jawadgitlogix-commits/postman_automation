@@ -25,6 +25,13 @@ function toVarMap(environmentJson = {}, collectionJson = {}) {
   return { ...collectionVars, ...envVars };
 }
 
+function normalizeBaseUrl(url) {
+  if (typeof url !== "string") return "";
+  const trimmed = url.trim();
+  if (!trimmed) return "";
+  return trimmed.endsWith("/") ? trimmed.slice(0, -1) : trimmed;
+}
+
 function resolveVars(text, vars) {
   if (typeof text !== "string") return text;
   return text.replace(/\{\{([^}]+)\}\}/g, (_, rawKey) => {
@@ -35,6 +42,28 @@ function resolveVars(text, vars) {
     }
     return `{{${key}}}`;
   });
+}
+
+function stripRequestScriptsFromCollection(node, counter) {
+  if (!node || typeof node !== "object") return;
+
+  if (Array.isArray(node.event)) {
+    const kept = [];
+    for (const event of node.event) {
+      if (event && (event.listen === "prerequest" || event.listen === "test")) {
+        counter.removed += 1;
+        continue;
+      }
+      kept.push(event);
+    }
+    node.event = kept;
+  }
+
+  if (Array.isArray(node.item)) {
+    for (const child of node.item) {
+      stripRequestScriptsFromCollection(child, counter);
+    }
+  }
 }
 
 function walkRequests(items, parentPath = [], out = []) {
@@ -82,12 +111,56 @@ function getBearerToken(authObj, vars) {
   return resolveVars(tokenEntry.value || "", vars);
 }
 
-function applyAuthHeaders({ request, collectionAuth, vars, headers }) {
+function applyAuthHeaders({ request, collectionAuth, vars, headers, endpointName = "", folderPath = [] }) {
   const auth = request?.auth || collectionAuth;
   if (!auth || auth.type === "noauth") return;
 
+  const lowered = new Set(Object.keys(headers).map((k) => String(k || "").toLowerCase()));
+  const hasAuthorizationHeader = lowered.has("authorization");
+  const hasCandidateTokenHeader = lowered.has("token");
+  const resolvedUrl = resolveVars(request?.url?.raw || "", vars);
+
+  const name = String(endpointName || "").toLowerCase();
+  const folder = folderPath.map((p) => String(p || "").toLowerCase()).join(" / ");
+  const url = String(resolvedUrl || "").toLowerCase();
+  const role =
+    hasCandidateTokenHeader ||
+    url.includes("/candidate") ||
+    folder.includes("candidate") ||
+    name.includes("candidate")
+      ? "candidate"
+      : url.includes("/staff") || folder.includes("staff") || name.includes("staff")
+        ? "staff"
+        : "default";
+
+  // Candidate auth style: raw token in `token` header (no Bearer).
+  if (role === "candidate" && !hasCandidateTokenHeader) {
+    const ct = typeof vars.candidate_token === "string" ? vars.candidate_token.trim() : "";
+    if (ct) headers.token = ct;
+  }
+
   if (auth.type === "bearer") {
-    const token = getBearerToken(auth, vars);
+    if (hasAuthorizationHeader || hasCandidateTokenHeader) return;
+
+    const tokenEntry = (auth.bearer || []).find((x) => x.key === "token");
+    const rawTokenValue = tokenEntry?.value || "";
+
+    let token = resolveVars(rawTokenValue, vars);
+    if (/\{\{\s*token\s*\}\}/i.test(rawTokenValue)) {
+      if (role === "staff" && typeof vars.staff_token === "string" && vars.staff_token.trim()) {
+        token = vars.staff_token.trim();
+      }
+      if (
+        role === "candidate" &&
+        typeof vars.candidate_token === "string" &&
+        vars.candidate_token.trim()
+      ) {
+        token = vars.candidate_token.trim();
+      }
+    }
+
+    if (!token && typeof vars.token === "string") token = vars.token.trim();
+    if (!token && typeof vars.staff_token === "string") token = vars.staff_token.trim();
     if (token) headers.Authorization = `Bearer ${token}`;
   }
 }
@@ -96,20 +169,67 @@ function parseResponseBody(text) {
   if (!text) return { json: null, message: "" };
   try {
     const json = JSON.parse(text);
-    const message =
-      json.message ||
-      json.error ||
-      json.detail ||
-      json.key ||
-      (Array.isArray(json.non_field_errors) ? json.non_field_errors[0] : "") ||
-      "";
-    return { json, message: String(message || "") };
+    const message = extractErrorMessage(json);
+    return { json, message };
   } catch (_) {
     return { json: null, message: String(text).slice(0, 300) };
   }
 }
 
-async function executeRequest({ request, vars, bodyOverride, collectionAuth }) {
+function extractErrorMessage(json) {
+  const seen = new Set();
+
+  function firstString(x) {
+    if (typeof x === "string" && x.trim()) return x.trim();
+    if (typeof x === "number" || typeof x === "boolean") return String(x);
+    if (!x || typeof x !== "object") return "";
+    if (seen.has(x)) return "";
+    seen.add(x);
+
+    if (Array.isArray(x)) {
+      for (const item of x) {
+        const s = firstString(item);
+        if (s) return s;
+      }
+      return "";
+    }
+
+    const preferredKeys = [
+      "message",
+      "error",
+      "detail",
+      "title",
+      "description",
+      "key",
+      "code",
+      "non_field_errors",
+      "errors",
+      "error_description",
+    ];
+    for (const k of preferredKeys) {
+      if (Object.prototype.hasOwnProperty.call(x, k)) {
+        const s = firstString(x[k]);
+        if (s) return s;
+      }
+    }
+
+    for (const v of Object.values(x)) {
+      const s = firstString(v);
+      if (s) return s;
+    }
+    return "";
+  }
+
+  const msg = firstString(json);
+  if (msg) return msg;
+  try {
+    return JSON.stringify(json).slice(0, 300);
+  } catch (_) {
+    return "";
+  }
+}
+
+async function executeRequest({ request, vars, bodyOverride, collectionAuth, endpointName, folderPath }) {
   const method = request.method || "GET";
   const rawUrl = request?.url?.raw || "";
   const url = resolveVars(rawUrl, vars);
@@ -117,7 +237,7 @@ async function executeRequest({ request, vars, bodyOverride, collectionAuth }) {
     throw new Error(`Unresolved URL variables in "${url}"`);
   }
   const headers = buildHeaders(request, vars);
-  applyAuthHeaders({ request, collectionAuth, vars, headers });
+  applyAuthHeaders({ request, collectionAuth, vars, headers, endpointName, folderPath });
   let body;
 
   if (bodyOverride) {
@@ -127,7 +247,22 @@ async function executeRequest({ request, vars, bodyOverride, collectionAuth }) {
     }
   }
 
-  const res = await fetch(url, { method, headers, body });
+  let res;
+  try {
+    res = await fetch(url, { method, headers, body });
+  } catch (err) {
+    const cause = err?.cause;
+    const parts = [
+      `fetch failed`,
+      `method=${method}`,
+      `url=${url}`,
+      cause?.code ? `code=${cause.code}` : "",
+      cause?.errno ? `errno=${cause.errno}` : "",
+      cause?.syscall ? `syscall=${cause.syscall}` : "",
+      cause?.message ? `cause=${cause.message}` : err?.message ? `cause=${err.message}` : "",
+    ].filter(Boolean);
+    throw new Error(parts.join(" | "));
+  }
   const text = await res.text();
   const parsed = parseResponseBody(text);
 
@@ -163,6 +298,8 @@ async function bootstrapTokens({ allRequests, vars, collectionAuth }) {
     vars,
     bodyOverride: loginBody,
     collectionAuth,
+    endpointName: loginEntry.name,
+    folderPath: loginEntry.folderPath,
   });
 
   if (login?.body?.access && (!vars.token || !vars.token.trim())) {
@@ -209,7 +346,16 @@ async function main() {
   const environmentPath = path.join(INPUT_ENVIRONMENTS, run.environmentFile);
   const collection = await fs.readJson(collectionPath);
   const environment = await fs.readJson(environmentPath);
+
+  const sanitizeCounter = { removed: 0 };
+  stripRequestScriptsFromCollection(collection, sanitizeCounter);
+
   const vars = toVarMap(environment, collection);
+  // Map common aliases to baseUrl for safety.
+  vars.baseUrl = normalizeBaseUrl(vars.baseUrl);
+  if (vars.baseUrl) {
+    if (!vars.localhost) vars.localhost = vars.baseUrl;
+  }
   const collectionAuth = collection.auth || null;
 
   const allRequests = walkRequests(collection.item || []);
@@ -235,6 +381,8 @@ async function main() {
         vars,
         bodyOverride: baseBody,
         collectionAuth,
+        endpointName: entry.name,
+        folderPath: entry.folderPath,
       });
     } catch (err) {
       skipped.push({
@@ -256,6 +404,8 @@ async function main() {
           vars,
           bodyOverride: variantBody,
           collectionAuth,
+          endpointName: entry.name,
+          folderPath: entry.folderPath,
         });
       } catch (err) {
         params.push({

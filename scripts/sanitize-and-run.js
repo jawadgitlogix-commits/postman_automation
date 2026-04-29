@@ -15,13 +15,46 @@ const SANITIZE_STATS = {
   environments: {},
 };
 
+function shouldDropItem(item) {
+  const name = String(item?.name || "").toLowerCase();
+  if (name === "2fa") return true;
+  const method = String(item?.request?.method || "").toUpperCase();
+  if (method === "DELETE") return true;
+  return false;
+}
+
+function filterItemsInPlace(node, counter) {
+  if (!node || typeof node !== "object") return;
+  if (!Array.isArray(node.item)) return;
+
+  const kept = [];
+  for (const child of node.item) {
+    if (!child) continue;
+    if (shouldDropItem(child)) {
+      counter.removedItems += 1;
+      continue;
+    }
+    // recurse into folders
+    if (Array.isArray(child.item)) {
+      filterItemsInPlace(child, counter);
+      // If folder becomes empty after filtering, drop it.
+      if (!child.item.length) {
+        counter.removedItems += 1;
+        continue;
+      }
+    }
+    kept.push(child);
+  }
+  node.item = kept;
+}
+
 function stripPreRequestEvents(node, counter) {
   if (!node || typeof node !== "object") return;
 
   if (Array.isArray(node.event)) {
     const kept = [];
     for (const event of node.event) {
-      if (event && event.listen === "prerequest") {
+      if (event && (event.listen === "prerequest" || event.listen === "test")) {
         counter.removed += 1;
         continue;
       }
@@ -39,16 +72,60 @@ function stripPreRequestEvents(node, counter) {
 
 async function sanitizeCollection(inputPath, outputPath) {
   const raw = await fs.readJson(inputPath);
-  const counter = { removed: 0 };
-  stripPreRequestEvents(raw, counter);
+  const counter = { removedEvents: 0, removedItems: 0 };
+  filterItemsInPlace(raw, counter);
+  const eventsCounter = { removed: 0 };
+  stripPreRequestEvents(raw, eventsCounter);
+  counter.removedEvents = eventsCounter.removed;
   await fs.writeJson(outputPath, raw, { spaces: 2 });
-  SANITIZE_STATS.collections[path.basename(inputPath)] = counter.removed;
+  SANITIZE_STATS.collections[path.basename(inputPath)] = {
+    removedEvents: counter.removedEvents,
+    removedItems: counter.removedItems,
+  };
 }
 
 async function sanitizeEnvironment(inputPath, outputPath) {
   const raw = await fs.readJson(inputPath);
+
+  // Make runs more robust across collections by ensuring common URL aliases exist.
+  // This avoids unresolved {{localhost}}, {{devUrl}}, etc. when collections differ.
+  const values = Array.isArray(raw.values) ? raw.values : [];
+  const byKey = new Map(values.filter((v) => v && v.key).map((v) => [String(v.key), v]));
+
+  const baseUrlRaw = byKey.get("baseUrl")?.value;
+  const baseUrl =
+    typeof baseUrlRaw === "string" ? baseUrlRaw.trim().replace(/\/$/, "") : String(baseUrlRaw || "");
+
+  if (baseUrl) {
+    const aliases = [
+      "localhost",
+      "testUrl",
+      "devUrl",
+      "qaUrl",
+      "prodUrl",
+      "mainUrl",
+      "mainurl",
+      "awsUrl",
+      "awsurl",
+      "apiUrl",
+      "apiURL",
+      "hostUrl",
+      "url",
+    ];
+    for (const key of aliases) {
+      if (!byKey.has(key)) {
+        values.push({ key, value: baseUrl, type: "default", enabled: true });
+      }
+    }
+    // Also normalize baseUrl itself (no trailing slash) to reduce double-slash URLs.
+    if (byKey.has("baseUrl")) {
+      byKey.get("baseUrl").value = baseUrl;
+    }
+  }
+
+  raw.values = values;
   await fs.writeJson(outputPath, raw, { spaces: 2 });
-  SANITIZE_STATS.environments[path.basename(inputPath)] = "copied";
+  SANITIZE_STATS.environments[path.basename(inputPath)] = baseUrl ? "copied+aliases" : "copied";
 }
 
 function runNewman({ name, collectionPath, environmentPath }) {

@@ -25,6 +25,13 @@ function toVarMap(environmentJson = {}, collectionJson = {}) {
   return { ...collectionVars, ...envVars };
 }
 
+function normalizeBaseUrl(url) {
+  if (typeof url !== "string") return "";
+  const trimmed = url.trim();
+  if (!trimmed) return "";
+  return trimmed.endsWith("/") ? trimmed.slice(0, -1) : trimmed;
+}
+
 function resolveVars(text, vars) {
   if (typeof text !== "string") return text;
   return text.replace(/\{\{([^}]+)\}\}/g, (_, rawKey) => {
@@ -59,20 +66,89 @@ function isIgnoredFolder(folderPath) {
   return folderPath.some((p) => String(p || "").toLowerCase() === "2fa");
 }
 
+function stripRequestScriptsFromCollection(node, counter) {
+  if (!node || typeof node !== "object") return;
+
+  if (Array.isArray(node.event)) {
+    const kept = [];
+    for (const event of node.event) {
+      if (event && (event.listen === "prerequest" || event.listen === "test")) {
+        counter.removed += 1;
+        continue;
+      }
+      kept.push(event);
+    }
+    node.event = kept;
+  }
+
+  if (Array.isArray(node.item)) {
+    for (const child of node.item) {
+      stripRequestScriptsFromCollection(child, counter);
+    }
+  }
+}
+
 function parseResponseBody(text) {
   if (!text) return { json: null, message: "" };
   try {
     const json = JSON.parse(text);
-    const message =
-      json.message ||
-      json.error ||
-      json.detail ||
-      json.key ||
-      (Array.isArray(json.non_field_errors) ? json.non_field_errors[0] : "") ||
-      "";
-    return { json, message: typeof message === "string" ? message : JSON.stringify(message) };
+    const message = extractErrorMessage(json);
+    return { json, message };
   } catch (_) {
     return { json: null, message: String(text).slice(0, 300) };
+  }
+}
+
+function extractErrorMessage(json) {
+  const seen = new Set();
+
+  function firstString(x) {
+    if (typeof x === "string" && x.trim()) return x.trim();
+    if (typeof x === "number" || typeof x === "boolean") return String(x);
+    if (!x || typeof x !== "object") return "";
+    if (seen.has(x)) return "";
+    seen.add(x);
+
+    if (Array.isArray(x)) {
+      for (const item of x) {
+        const s = firstString(item);
+        if (s) return s;
+      }
+      return "";
+    }
+
+    const preferredKeys = [
+      "message",
+      "error",
+      "detail",
+      "title",
+      "description",
+      "key",
+      "code",
+      "non_field_errors",
+      "errors",
+      "error_description",
+    ];
+    for (const k of preferredKeys) {
+      if (Object.prototype.hasOwnProperty.call(x, k)) {
+        const s = firstString(x[k]);
+        if (s) return s;
+      }
+    }
+
+    for (const v of Object.values(x)) {
+      const s = firstString(v);
+      if (s) return s;
+    }
+    return "";
+  }
+
+  const msg = firstString(json);
+  if (msg) return msg;
+  try {
+    return JSON.stringify(json).slice(0, 300);
+  } catch (_) {
+    return "";
   }
 }
 
@@ -83,16 +159,72 @@ function getBearerToken(authObj, vars) {
   return resolveVars(tokenEntry.value || "", vars);
 }
 
-function buildHeaders(request, vars, collectionAuth) {
+function inferAuthRole({ folderPath = [], resolvedUrl = "", headers = {} }) {
+  const headerKeys = new Set(Object.keys(headers).map((k) => String(k || "").toLowerCase()));
+  if (headerKeys.has("token")) return "candidate";
+
+  const folder = folderPath.map((p) => String(p || "").toLowerCase()).join(" / ");
+  const url = String(resolvedUrl || "").toLowerCase();
+
+  if (folder.includes("candidate") || url.includes("/candidate")) {
+    return "candidate";
+  }
+  if (folder.includes("staff") || url.includes("/staff")) {
+    return "staff";
+  }
+  return "default";
+}
+
+function buildHeaders({ request, vars, collectionAuth, folderPath, resolvedUrl }) {
   const headers = {};
   for (const h of request?.header || []) {
     if (!h || h.disabled || !h.key) continue;
     headers[h.key] = resolveVars(h.value ?? "", vars);
   }
 
+  const role = inferAuthRole({ folderPath, resolvedUrl, headers });
+  const lowered = new Set(Object.keys(headers).map((k) => String(k || "").toLowerCase()));
+
+  // Candidate auth style: raw token in `token` header (no Bearer).
+  if (role === "candidate" && !lowered.has("token")) {
+    const ct = typeof vars.candidate_token === "string" ? vars.candidate_token.trim() : "";
+    if (ct) headers.token = ct;
+  }
+
+  // Apply bearer auth only when:
+  // - request isn't explicitly noauth
+  // - request doesn't already specify Authorization
+  // - request isn't using candidate token header style
   const auth = request?.auth || collectionAuth;
-  if (auth && auth.type !== "noauth" && auth.type === "bearer") {
-    const token = getBearerToken(auth, vars);
+  const hasAuthorizationHeader = lowered.has("authorization");
+  const hasCandidateTokenHeader = lowered.has("token");
+  if (
+    auth &&
+    auth.type !== "noauth" &&
+    auth.type === "bearer" &&
+    !hasAuthorizationHeader &&
+    !hasCandidateTokenHeader
+  ) {
+    const tokenEntry = (auth.bearer || []).find((x) => x.key === "token");
+    const rawTokenValue = tokenEntry?.value || "";
+
+    let token = resolveVars(rawTokenValue, vars);
+    // Heuristic: if collection uses {{token}}, prefer staff/candidate-specific tokens when available.
+    if (/\{\{\s*token\s*\}\}/i.test(rawTokenValue)) {
+      if (role === "staff" && typeof vars.staff_token === "string" && vars.staff_token.trim()) {
+        token = vars.staff_token.trim();
+      }
+      if (
+        role === "candidate" &&
+        typeof vars.candidate_token === "string" &&
+        vars.candidate_token.trim()
+      ) {
+        token = vars.candidate_token.trim();
+      }
+    }
+
+    if (!token && typeof vars.token === "string") token = vars.token.trim();
+    if (!token && typeof vars.staff_token === "string") token = vars.staff_token.trim();
     if (token) headers.Authorization = `Bearer ${token}`;
   }
 
@@ -109,6 +241,74 @@ function getJsonBodyObject(request) {
     return null;
   }
   return null;
+}
+
+function findLoginRequest(allRequests) {
+  // Prefer an explicit "login" request name, otherwise find /auth/token/ endpoint.
+  const byName = allRequests.find((r) => String(r.name || "").toLowerCase() === "login");
+  if (byName) return byName;
+
+  return allRequests.find((r) => {
+    const raw = String(r.request?.url?.raw || "").toLowerCase();
+    return raw.includes("/auth/token") || raw.includes("/auth/token/");
+  });
+}
+
+function setTokenVars(vars, token) {
+  if (!token || typeof token !== "string") return;
+  const t = token.trim();
+  if (!t) return;
+  vars.token = t;
+  // Force one fresh login token for all auth styles in this run.
+  vars.staff_token = t;
+  vars.candidate_token = t;
+}
+
+async function bootstrapTokens({ allRequests, vars, collectionAuth }) {
+  const loginEntry = findLoginRequest(allRequests);
+  if (!loginEntry) {
+    // Fallback to any pre-supplied token if login endpoint doesn't exist.
+    const hasToken = typeof vars.token === "string" && vars.token.trim().length > 0;
+    if (hasToken) setTokenVars(vars, vars.token);
+    return;
+  }
+
+  const loginBody = getJsonBodyObject(loginEntry.request);
+  if (!loginBody) {
+    const hasToken = typeof vars.token === "string" && vars.token.trim().length > 0;
+    if (hasToken) setTokenVars(vars, vars.token);
+    return;
+  }
+
+  let login;
+  try {
+    const loginUrl = buildUrlWithQuery({ request: loginEntry.request, vars });
+    login = await executeRequest({
+      request: loginEntry.request,
+      vars,
+      collectionAuth,
+      folderPath: loginEntry.folderPath,
+      urlOverride: loginUrl,
+      bodyOverride: loginBody,
+    });
+  } catch (_) {
+    const hasToken = typeof vars.token === "string" && vars.token.trim().length > 0;
+    if (hasToken) setTokenVars(vars, vars.token);
+    return;
+  }
+
+  // Common response shapes:
+  // - { access, refresh }
+  // - { token }
+  const access = login?.body?.access || login?.body?.token || "";
+  if (typeof access === "string" && access.trim()) {
+    setTokenVars(vars, access);
+    return;
+  }
+
+  // Login returned but token not found in response; fallback to existing vars if available.
+  const hasToken = typeof vars.token === "string" && vars.token.trim().length > 0;
+  if (hasToken) setTokenVars(vars, vars.token);
 }
 
 function getEnabledQueryParams(request, vars) {
@@ -134,10 +334,23 @@ function buildUrlWithQuery({ request, vars, queryOverride }) {
   return u.toString();
 }
 
-async function executeRequest({ request, vars, collectionAuth, urlOverride, bodyOverride }) {
+async function executeRequest({
+  request,
+  vars,
+  collectionAuth,
+  folderPath,
+  urlOverride,
+  bodyOverride,
+}) {
   const method = request.method || "GET";
   const url = urlOverride || buildUrlWithQuery({ request, vars });
-  const headers = buildHeaders(request, vars, collectionAuth);
+  const headers = buildHeaders({
+    request,
+    vars,
+    collectionAuth,
+    folderPath,
+    resolvedUrl: url,
+  });
 
   let body;
   if (bodyOverride) {
@@ -147,18 +360,42 @@ async function executeRequest({ request, vars, collectionAuth, urlOverride, body
     }
   }
 
-  const res = await fetch(url, { method, headers, body });
+  let res;
+  try {
+    const controller = new AbortController();
+    const timeoutMs = Number(vars.requestTimeoutMs || 30000);
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      res = await fetch(url, { method, headers, body, signal: controller.signal });
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  } catch (err) {
+    const cause = err?.cause;
+    const parts = [
+      `fetch failed`,
+      `method=${method}`,
+      `url=${url}`,
+      err?.name ? `error=${err.name}` : "",
+      cause?.code ? `code=${cause.code}` : "",
+      cause?.errno ? `errno=${cause.errno}` : "",
+      cause?.syscall ? `syscall=${cause.syscall}` : "",
+      cause?.message ? `cause=${cause.message}` : err?.message ? `cause=${err.message}` : "",
+    ].filter(Boolean);
+    throw new Error(parts.join(" | "));
+  }
+
   const text = await res.text();
   const parsed = parseResponseBody(text);
   return { status: res.status, ok: res.ok, message: parsed.message, body: parsed.json };
 }
 
 function inferRequired({ baseline, variant }) {
-  if (!baseline.ok && !variant.ok) return "unknown";
-  if (baseline.ok && !variant.ok) return "required";
-  if (baseline.ok && variant.ok) return "optional";
-  if (!baseline.ok && variant.ok) return "optional";
-  return "unknown";
+  // User-requested strict rule:
+  // - if omitted-param request fails/errors => required
+  // - if omitted-param request succeeds => optional
+  // Baseline is still captured for visibility but does not affect classification.
+  return variant.ok ? "optional" : "required";
 }
 
 async function main() {
@@ -172,12 +409,32 @@ async function main() {
   const environmentPath = path.join(INPUT_ENVIRONMENTS, run.environmentFile);
   const collection = await fs.readJson(collectionPath);
   const environment = await fs.readJson(environmentPath);
+
+  // Sanitize collection in-memory before replaying requests:
+  // remove both pre-request scripts and test scripts.
+  const sanitizeCounter = { removed: 0 };
+  stripRequestScriptsFromCollection(collection, sanitizeCounter);
+
   const vars = toVarMap(environment, collection);
+  // Map common aliases to baseUrl for safety.
+  vars.baseUrl = normalizeBaseUrl(vars.baseUrl);
+  if (vars.baseUrl) {
+    if (!vars.localhost) vars.localhost = vars.baseUrl;
+  }
+
   const collectionAuth = collection.auth || null;
 
   const allRequests = walkRequests(collection.item || []).filter(
     (r) => !isIgnoredFolder(r.folderPath)
   );
+
+  // If the environment doesn't provide a token, try to obtain one via the collection's login call.
+  // This reduces "unknown" classifications caused by 401 baselines.
+  try {
+    await bootstrapTokens({ allRequests, vars, collectionAuth });
+  } catch (_) {
+    // If bootstrap fails, continue; requests may still succeed without auth.
+  }
 
   // Ignore DELETE, run GET/POST/PUT only.
   const selected = allRequests.filter((r) => {
@@ -188,6 +445,7 @@ async function main() {
   const results = [];
   const skipped = [];
 
+  let processedSoFar = 0;
   for (const entry of selected) {
     const method = String(entry.request.method || "").toUpperCase();
     const folder = entry.folderPath.join(" / ");
@@ -202,6 +460,7 @@ async function main() {
             request: entry.request,
             vars,
             collectionAuth,
+            folderPath: entry.folderPath,
             urlOverride: url,
           });
           results.push({
@@ -226,6 +485,7 @@ async function main() {
           request: entry.request,
           vars,
           collectionAuth,
+          folderPath: entry.folderPath,
           urlOverride: baselineUrl,
         });
 
@@ -237,19 +497,30 @@ async function main() {
             vars,
             queryOverride: variantQuery,
           });
-          const variant = await executeRequest({
-            request: entry.request,
-            vars,
-            collectionAuth,
-            urlOverride: variantUrl,
-          });
-          params.push({
-            param: key,
-            classification: inferRequired({ baseline, variant }),
-            baselineStatus: baseline.status,
-            withoutParamStatus: variant.status,
-            withoutParamMessage: variant.message,
-          });
+          try {
+            const variant = await executeRequest({
+              request: entry.request,
+              vars,
+              collectionAuth,
+              folderPath: entry.folderPath,
+              urlOverride: variantUrl,
+            });
+            params.push({
+              param: key,
+              classification: inferRequired({ baseline, variant }),
+              baselineStatus: baseline.status,
+              withoutParamStatus: variant.status,
+              withoutParamMessage: variant.message,
+            });
+          } catch (err) {
+            params.push({
+              param: key,
+              classification: "required",
+              baselineStatus: baseline.status,
+              withoutParamStatus: null,
+              withoutParamMessage: err.message,
+            });
+          }
         }
 
         results.push({
@@ -272,6 +543,7 @@ async function main() {
         request: entry.request,
         vars,
         collectionAuth,
+        folderPath: entry.folderPath,
         urlOverride: url,
         bodyOverride: baseBody || undefined,
       });
@@ -281,20 +553,31 @@ async function main() {
         for (const key of Object.keys(baseBody)) {
           const variantBody = { ...baseBody };
           delete variantBody[key];
-          const variant = await executeRequest({
-            request: entry.request,
-            vars,
-            collectionAuth,
-            urlOverride: url,
-            bodyOverride: variantBody,
-          });
-          params.push({
-            param: key,
-            classification: inferRequired({ baseline, variant }),
-            baselineStatus: baseline.status,
-            withoutParamStatus: variant.status,
-            withoutParamMessage: variant.message,
-          });
+          try {
+            const variant = await executeRequest({
+              request: entry.request,
+              vars,
+              collectionAuth,
+              folderPath: entry.folderPath,
+              urlOverride: url,
+              bodyOverride: variantBody,
+            });
+            params.push({
+              param: key,
+              classification: inferRequired({ baseline, variant }),
+              baselineStatus: baseline.status,
+              withoutParamStatus: variant.status,
+              withoutParamMessage: variant.message,
+            });
+          } catch (err) {
+            params.push({
+              param: key,
+              classification: "required",
+              baselineStatus: baseline.status,
+              withoutParamStatus: null,
+              withoutParamMessage: err.message,
+            });
+          }
         }
       }
 
@@ -316,6 +599,11 @@ async function main() {
         reason: err.message,
       });
     }
+
+    processedSoFar += 1;
+    if (processedSoFar % 10 === 0) {
+      console.log(`Processed ${processedSoFar}/${selected.length} endpoints...`);
+    }
   }
 
   const outPath = path.join(REPORTS_DIR, "required-params-report-all.json");
@@ -323,7 +611,8 @@ async function main() {
     outPath,
     {
       generatedAt: new Date().toISOString(),
-      note: "GET params tested by omitting enabled query params; POST/PUT tested by omitting JSON body fields. DELETE ignored. Auth/2FA folder ignored.",
+      note: "GET params tested by omitting enabled query params; POST/PUT tested by omitting JSON body fields. DELETE ignored. Auth/2FA folder ignored. Collection scripts removed (prerequest + test) before replaying.",
+      sanitize: { removedCollectionEvents: sanitizeCounter.removed },
       selectedEndpoints: selected.length,
       processedEndpoints: results.length,
       skippedEndpoints: skipped.length,

@@ -1,74 +1,114 @@
-# Postman Automation (No Postman Changes)
+# Postman Automation Framework (Generic)
 
-This project runs Postman collections in an isolated way:
+Generic Node.js automation to run **any** Postman collection from the filesystem (via Newman), generate execution reports (including failures), and produce **required vs optional parameter** reports by replaying requests and removing one parameter at a time.
 
-- No writes to the Postman app
-- No save back to your collections/environments
-- Pre-request scripts are removed from copied collection files before execution
+## Key features
 
-It also includes “required vs optional” parameter validation by replaying calls and removing one parameter at a time.
+- **Safe / isolated runs**: uses exported JSON files from disk; creates sanitized copies at runtime (pre-request scripts removed).
+- **Newman execution reports**: per-run JSON output + overall summary (useful to review failed requests).
+- **Required/optional parameter validation**:
+  - **GET**: omit enabled query params one-by-one
+  - **POST/PUT**: omit JSON body fields one-by-one (raw JSON bodies)
+- **Two report levels**:
+  - Detailed: status codes + extracted error messages per variant
+  - Simplified: `required: true/false` (with `unknown => required: true` per rule)
 
-## 1) Put exported JSON files
+## Folder structure
 
-Export from Postman once and place files here:
+- `scripts/`: automation scripts (Newman + param validators + report builders)
+- `input/collections/`: exported Postman collection JSON (local)
+- `input/environments/`: exported Postman environment JSON (local)
+- `tmp/`: sanitized runtime copies (ignored by git)
+- `reports/`: generated outputs (ignored by git)
+- `examples/`: safe templates to copy
+- `run-config.json`: local run configuration (ignored by git)
+- `run-config.example.json`: committable config template
 
-- `input/collections/*.postman_collection.json`
-- `input/environments/*.postman_environment.json`
+## Setup
 
-See `examples/` for safe templates you can copy.
+### 1) Put exported JSON files
 
-## 2) Configure run matrix
+Export from Postman and place files here:
 
-Copy `run-config.example.json` to `run-config.json` and list all collection/environment pairs.
+- `input/collections/<collection>.postman_collection.json`
+- `input/environments/<environment>.postman_environment.json`
 
-## 3) Install dependencies
+Use `examples/` as templates (do **not** commit tokens).
+
+### 2) Configure runs
+
+Copy `run-config.example.json` → `run-config.json` and map your collection/environment filenames. You can define multiple runs (e.g., multiple APIs or environments).
+
+### 3) Install
 
 ```bash
 npm install
 ```
 
-## 4) Run everything
+## Run commands
+
+### Run Newman suite (full collection execution)
 
 ```bash
 npm run automate
 ```
 
-Run only matching jobs (example: dev):
+Optional filter (example: run names containing “dev”):
 
 ```bash
 npm run automate:dev
 ```
 
-## 5) Parameter validation
+### Validate required/optional params
 
-Validate **POST/PUT JSON body** required/optional fields:
+POST/PUT (raw JSON body only):
 
 ```bash
 npm run validate:params
 ```
 
-Validate **GET query params** + **POST/PUT body params** (ignores DELETE and skips the `Auth / 2FA` folder):
+GET + POST + PUT (ignores DELETE; can skip specific folders based on script rules):
 
 ```bash
 npm run validate:all
 ```
 
-Build the simplified `required=true/false` report for the all-method run:
+Build simplified `required=true/false` report for the all-method run:
 
 ```bash
 npm run build:simple:all
 ```
 
-## What happens during run
+## How required/optional is inferred
 
-1. Input files are read from `input/`
-2. Sanitized copies are written to `tmp/` (all pre-request events removed)
-3. Newman runs using sanitized copies
-4. Reports are generated in `reports/`
+For each endpoint and parameter:
 
-## Output
+- Baseline request = original request
+- Variant request = same request with **one parameter removed**
 
-- Per-run JSON report in `reports/`
-- Final summary in `reports/summary.json`
-- Detailed param report(s) in `reports/required-params-report*.json`
-- Simplified param report(s) in `reports/required-params-simple*.json`
+Classification:
+
+- **required**: baseline OK, variant fails
+- **optional**: baseline OK, variant OK
+- **unknown**: baseline fails (auth/state/other), or cannot isolate parameter effect reliably
+
+Simplified mapping rule:
+
+- `optional` → `required:false`
+- `required` → `required:true`
+- `unknown` → `required:true`
+
+## Outputs (generated locally)
+
+- **Newman**:
+  - `reports/<run-name>.json` (Newman JSON output including failures)
+  - `reports/summary.json` (rollup summary for the suite)
+- **Param validation**:
+  - `reports/required-params-report.json` (POST/PUT body-only)
+  - `reports/required-params-report-all.json` (GET+POST+PUT)
+  - `reports/required-params-simple-all.json` (simplified required boolean)
+
+## Notes
+
+- **Auth is API-dependent**: tokens/headers live in your Postman environment export. Keep secrets local (gitignored).
+- **Unknowns happen** when endpoints are stateful (need IDs) or auth isn’t valid. Reduce unknowns by adding setup flows (create prereqs, capture IDs) and ensuring the correct role/token is used per endpoint.
